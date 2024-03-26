@@ -123,9 +123,13 @@ def create_output_files(org)
     file.puts("Repo,Message Type,Message")
   end
 
+  # Check if the PRs file already exists, if not create it
   $prs_csv = "#{$output_folder}/#{org}_prs.csv"
-  File.open($prs_csv, "w") do |file|
-    file.puts("Repo,Branch,State,Merged At,URL")
+  unless File.exist?($prs_csv)
+    puts "Creating PRs file: #{$prs_csv}"
+    File.open($prs_csv, "w") do |file|
+      file.puts("Repo,Branch,PR Num,State,Merged At,URL")
+    end
   end
 end #end of create_output_files
 
@@ -213,14 +217,16 @@ end # end of reportRateLimit
 ##############################################################################################################
 def main()
   setupOctokit()
-  org = 'ts-source'
-  devopsPrefix = 'qqqDevOps_' # if all branches we create have a unique prefix, we can find them later
+  org = 'PSJH-Dev'
+  devopsPrefix = 'qqqGitHubAdminOps_' # if all branches we create have a unique prefix, we can find them later
   branchName =  devopsPrefix + 'patchNumber48'
-  pr_name = "DevOps patching repo..."
+  # TODO: Replace this with a pull from a markdown file
+  pr_name = "GitHub Admins patching repo..."
   debug_flag = true
   create_output_files(org)
   repos = retrieveRepos(org)
-
+  # TODO: Allow ability to pull files from a specific directory. These can act like projects. AKA change cwd
+  # TODO: The script needs to maintain status of all repo prs. It should not attempt a PR if one already exists. BUT it should update status if one is found.
   repos.each_with_index do |repo, index|
     reportRateLimit("repo") if index % 50 == 0
     suspend_s = 5
@@ -229,6 +235,8 @@ def main()
         log($output_csv,"#{repo},warning,Repo does not exist", true)
         next
       end
+      # TODO: This is next
+      #TODO: Check if the PR already exists. If it does, update the status of the PR. If it does not, create the new PR
 
       mainBranch = $client.branch(repo, $client.repository(repo).default_branch)
 
