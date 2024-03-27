@@ -43,6 +43,17 @@ rescue Octokit::NotFound
 end
 
 ##############################################################################################################
+# Return the info for a pr if it exists, otherwise return nil
+def get_pr_info(client, repo, pr_number)
+  begin
+    pr = client.pull_request(repo, pr_number)
+    return pr
+  rescue Octokit::NotFound
+    return nil
+  end
+end
+
+##############################################################################################################
 def getReposToInclude(org)
   reposToInclude = []
   # Read the list of repositories to include from a text file
@@ -113,6 +124,13 @@ def mergePR(repoFullName, thePR)
 end
 
 ##############################################################################################################
+def create_new_prs_file
+  File.open($prs_csv, "w") do |file|
+    file.puts("Repo,Branch,PR Num,State,Merged At,URL")
+  end
+end
+
+##############################################################################################################
 def create_output_files(org)
   create_output_folders()
   time = Time.new
@@ -133,8 +151,9 @@ def create_output_files(org)
   end
 end #end of create_output_files
 
+
 ##############################################################################################################
-def create_output_folders()
+def create_output_folders
   $output_folder = "_out"
   unless File.directory?($output_folder)
     Dir.mkdir($output_folder)
@@ -196,26 +215,38 @@ def validateFilesWereAdded(repo, shaFromMerge)
 end
 
 
-##############################################################################################################
-def reportOnExistingDevOpsPRs(repo, devopsPrefix)
-  existingPRs = $client.pull_requests(repo, state: 'all')
-  existingPRs.each do |pr|
-    if pr.head.ref.start_with?(devopsPrefix)
-      log($prs_csv, "#{repo},#{pr.head.ref},#{pr.state},#{pr.merged_at},#{pr.html_url}", false)
-    end
-  end
-end # end of reportOnExistingDevOpsPRs
-
-##############################################################################################################
 # dump out api rate limit used, and remaining
 def reportRateLimit(extraMsg)
   rateLimit = $client.rate_limit!
   puts "::: API Rate Limit: #{extraMsg}: #{rateLimit.remaining} of #{rateLimit.limit} requests remaining. Resets at: #{rateLimit.resets_at}"
 end # end of reportRateLimit
 
+
+# Use the csv file to create a hash of repos and their statuses
+def initialize_prs_hash
+  $prs_hash = {}
+  CSV.foreach($prs_csv, headers: true) do |row|
+    $prs_hash[row['Repo']] = { 'State' => row['State'], 'MergedAt' => row['MergedAt'], 'Url' => row['Url'] }
+  end
+end
+
+# Get the state of a repo from the prs hash, if it exists
+def get_repo_state(repo)
+  return $prs_hash[repo].nil? ? 'none' : $prs_hash[repo]['State']
+end
+
+def write_pr_hash_value_to_csv(repo)
+  write_pr_to_csv(repo, $prs_hash[repo]['Branch'], $prs_hash[repo]['PR Num'], $prs_hash[repo]['State'], $prs_hash[repo]['MergedAt'], $prs_hash[repo]['Url'])
+end
+
+def write_pr_to_csv(repo, branch, pr_number, state, merged_at, url)
+  File.open($prs_csv, "a") do |file|
+    file.puts("#{repo},#{branch},#{pr_number},#{state},#{merged_at},#{url}")
+  end
+end
+
 ##############################################################################################################
-##############################################################################################################
-def main()
+def main
   setupOctokit()
   org = 'PSJH-Dev'
   devopsPrefix = 'qqqGitHubAdminOps_' # if all branches we create have a unique prefix, we can find them later
@@ -224,6 +255,10 @@ def main()
   pr_name = "GitHub Admins patching repo..."
   debug_flag = true
   create_output_files(org)
+  # Create a hash of the repos and their statuses from the prs file
+  initialize_prs_hash()
+  # Overwrite the prs file now that the hash has been created
+  create_new_prs_file()
   repos = retrieveRepos(org)
   # TODO: Allow ability to pull files from a specific directory. These can act like projects. AKA change cwd
   # TODO: The script needs to maintain status of all repo prs. It should not attempt a PR if one already exists. BUT it should update status if one is found.
@@ -231,13 +266,32 @@ def main()
     reportRateLimit("repo") if index % 50 == 0
     suspend_s = 5
     begin
+      # Check the status of the PR in the hash
+      case get_repo_state(repo).downcase
+      # if the status is merged or closed, skip the repo. Write a line in the csv file that says the pr is closed or merged
+      when 'merged', 'closed'
+        log($output_csv,"#{repo},notice,PR already merged or closed", true)
+        write_pr_hash_value_to_csv(repo)
+        next
+      # if the status is open, branch, or draft check the current pr status to see if it needs to be updated. update the file
+      when 'open', 'draft', 'branch'
+        pr = get_pr_info($client, repo, $prs_hash[repo]['PR Num'])
+        if pr.nil?
+          # the PR doesn't exist, there may be an error in the CSV file
+          log($output_csv,"#{repo},warning,PR#{$prs_hash[repo]['PR Num']} does not exist, this may be an error in the original CSV file. Removing this record", true)
+          next
+        else
+          log($output_csv,"#{repo},notice,PR already exists updating status if needed", true)
+          write_pr_to_csv(repo, pr.head.ref, pr.number, pr.state, pr.merged_at, pr.html_url)
+          next
+        end
+      end
+      # Send an error if the repo does not exist
       if !repo_exists?($client, repo)
         log($output_csv,"#{repo},warning,Repo does not exist", true)
         next
       end
-      # TODO: This is next
-      #TODO: Check if the PR already exists. If it does, update the status of the PR. If it does not, create the new PR
-
+      
       mainBranch = $client.branch(repo, $client.repository(repo).default_branch)
 
       if !branch_exists?($client, repo, branchName)
@@ -245,7 +299,6 @@ def main()
       end
 
       numberOfFilesAdded = addFilesToRepo(repo, branchName)
-      # reportOnExistingDevOpsPRs(repo, devopsPrefix) # report on existing PRs before creating a new one
       thePR = create_pull_request(repo, mainBranch, branchName, pr_name)
       mergeSHA=mergePR(repo, thePR)
       validateFilesWereAdded(repo, mergeSHA) if debug_flag
@@ -263,3 +316,16 @@ def main()
 end # main
 
 main()
+
+
+# Plan
+# Create a hash of the repos and their statuses from the prs file
+# Overwrite the prs file
+# For each repo in the list of repos to add a pr to
+# If the repo is in the hash
+# - Check the status
+# - if the status is merged or closed, skip the repo. Write a line in the csv file that says the pr is closed or merged
+# - if the status is open, branch, or draft check the current pr status to see if it needs to be updated. update the file
+# TODO:
+# If the repo is not in the hash
+# - Create a new pr and add the info to the csv file
