@@ -11,6 +11,7 @@
 # 8. Outputs the results to CSV files.
 #
 require 'octokit'
+require 'csv'
 
 ##############################################################################################################
 def log(file,msg,screenEcho)
@@ -43,16 +44,27 @@ rescue Octokit::NotFound
 end
 
 ##############################################################################################################
+# Return the info for a pr if it exists, otherwise return nil
+def get_pr_info(client, repo, pr_number)
+  begin
+    pr = client.pull_request(repo, pr_number)
+    return pr
+  rescue Octokit::NotFound
+    return nil
+  end
+end
+
+##############################################################################################################
 def getReposToInclude(org)
   reposToInclude = []
   # Read the list of repositories to include from a text file
   repoIncludeFile = 'include-repos.txt'
   if File.exist?(repoIncludeFile)
-    puts "\nFile #{repoIncludeFile} exists, using it to filter Repos in the Source Org\n\n"
+    puts "File #{repoIncludeFile} exists, using it to filter Repos in the Source Org"
     reposToInclude = File.readlines(repoIncludeFile).map(&:chomp).reject { |line| line.strip.empty? || line.start_with?("#") }
     reposToInclude.map! { |repo| "#{org}/#{repo}" } # add in org/ to each repo name
   else
-    puts "\nFile #{repoIncludeFile} does not exist. Processing ALL Repos in the Source Org\n\n"
+    puts "File #{repoIncludeFile} does not exist. Processing ALL Repos in the Source Org"
     reposToInclude = $client.org_repos(org).map(&:full_name)
   end
   return reposToInclude
@@ -63,11 +75,11 @@ def getReposToExclude(org)
   # Read the list of repositories to exclude from a text file
   repoExcludeFile = 'exclude-repos.txt'
   if File.exist?(repoExcludeFile)
-    puts "\nFile #{repoExcludeFile} exists, using it to filter Repos in the Source Org\n\n"
+    puts "File #{repoExcludeFile} exists, using it to filter Repos in the Source Org"
     reposToExclude = File.readlines(repoExcludeFile).map(&:chomp).reject { |line| line.strip.empty? || line.start_with?("#") }
     reposToExclude.map! { |repo| "#{org}/#{repo}" } # add in org/ to each repo name
   else
-    puts "\nFile #{repoExcludeFile} does not exist. Processing ALL Repos that were included\n\n"
+    puts "File #{repoExcludeFile} does not exist. Processing ALL Repos that were included"
   end
   return reposToExclude
 end # getReposToExclude
@@ -113,6 +125,13 @@ def mergePR(repoFullName, thePR)
 end
 
 ##############################################################################################################
+def create_new_prs_file
+  File.open($prs_csv, "w") do |file|
+    file.puts("Repo,Branch,PR Num,State,Merged At,URL")
+  end
+end
+
+##############################################################################################################
 def create_output_files(org)
   create_output_folders()
   time = Time.new
@@ -123,14 +142,19 @@ def create_output_files(org)
     file.puts("Repo,Message Type,Message")
   end
 
+  # Check if the PRs file already exists, if not create it
   $prs_csv = "#{$output_folder}/#{org}_prs.csv"
-  File.open($prs_csv, "w") do |file|
-    file.puts("Repo,Branch,State,Merged At,URL")
+  unless File.exist?($prs_csv)
+    puts "Creating PRs file: #{$prs_csv}"
+    File.open($prs_csv, "w") do |file|
+      file.puts("Repo,Branch,PR Num,State,Merged At,URL")
+    end
   end
 end #end of create_output_files
 
+
 ##############################################################################################################
-def create_output_folders()
+def create_output_folders
   $output_folder = "_out"
   unless File.directory?($output_folder)
     Dir.mkdir($output_folder)
@@ -192,57 +216,106 @@ def validateFilesWereAdded(repo, shaFromMerge)
 end
 
 
-##############################################################################################################
-def reportOnExistingDevOpsPRs(repo, devopsPrefix)
-  existingPRs = $client.pull_requests(repo, state: 'all')
-  existingPRs.each do |pr|
-    if pr.head.ref.start_with?(devopsPrefix)
-      log($prs_csv, "#{repo},#{pr.head.ref},#{pr.state},#{pr.merged_at},#{pr.html_url}", false)
-    end
-  end
-end # end of reportOnExistingDevOpsPRs
-
-##############################################################################################################
 # dump out api rate limit used, and remaining
 def reportRateLimit(extraMsg)
   rateLimit = $client.rate_limit!
   puts "::: API Rate Limit: #{extraMsg}: #{rateLimit.remaining} of #{rateLimit.limit} requests remaining. Resets at: #{rateLimit.resets_at}"
 end # end of reportRateLimit
 
+
+# Use the csv file to create a hash of repos and their statuses
+def initialize_prs_hash
+  $prs_hash = {}
+  CSV.foreach($prs_csv, headers: true) do |row|
+    $prs_hash[row['Repo']] = { 'Branch' => row['Branch'], 'PR Num' => row['PR Num'], 'State' => row['State'], 'MergedAt' => row['Merged At'], 'Url' => row['URL']}
+  end
+end
+
+# Get the state of a repo from the prs hash, if it exists
+def get_repo_state(repo)
+  return $prs_hash[repo].nil? ? 'none' : $prs_hash[repo]['State']
+end
+
+def write_pr_hash_value_to_csv(repo)
+  write_pr_to_csv(repo, $prs_hash[repo]['Branch'], $prs_hash[repo]['PR Num'], $prs_hash[repo]['State'], $prs_hash[repo]['MergedAt'], $prs_hash[repo]['Url'])
+end
+
+def write_pr_to_csv(repo, branch, pr_number, state, merged_at, url)
+  File.open($prs_csv, "a") do |file|
+    file.puts("#{repo},#{branch},#{pr_number},#{state},#{merged_at},#{url}")
+  end
+end
+
+def get_default_branch(repo)
+    branch = $client.branch(repo, $client.repository(repo).default_branch)
+    return branch
+  rescue Octokit::NotFound
+    log($output_csv,"#{repo},warning,Repo does not exist. Skipping", true)
+    return nil
+end
+
+def create_pr_branch(repo, branchSource, newBranchName)
+    $client.create_ref(repo, "refs/heads/#{newBranchName}", branchSource.commit.sha)
+  rescue Octokit::UnprocessableEntity => e
+    if e.message.include?("Reference already exists")
+      log($output_csv,"#{repo},warning,Branch #{newBranchName} already exists. Skipping creation.", true)
+    else
+      raise e
+    end
+end
+
+def create_new_pr(repo, branchName)
+  log($output_csv,"#{repo},notice,PR does not exist. Creating a new PR", true)
+  mainBranch = get_default_branch(repo)
+  # Return if the repo does not exist
+  if mainBranch.nil?
+    return
+  end
+  create_pr_branch(repo, mainBranch, branchName)
+  addFilesToRepo(repo, branchName)
+  thePR = create_pull_request(repo, mainBranch, branchName, pr_name)
+  write_pr_to_csv(repo, branchName, thePR.number, thePR.state, thePR.merged_at, thePR.html_url)
+end
+
+def update_csv_with_newest_pr_info(repo)
+  pr = get_pr_info($client, repo, $prs_hash[repo]['PR Num'])
+  if pr.nil?
+    # the PR doesn't exist, there may be an error in the CSV file
+    log($output_csv,"#{repo},warning,PR#{$prs_hash[repo]['PR Num']} does not exist this may be an error in the original CSV file. Removing this record", true)
+    next
+  end
+  log($output_csv,"#{repo},notice,PR already exists. Updating with newest stats pulled from API", true)
+  write_pr_to_csv(repo, pr.head.ref, pr.number, pr.state, pr.merged_at, pr.html_url)
+
 ##############################################################################################################
-##############################################################################################################
-def main()
+def main
   setupOctokit()
-  org = 'ts-source'
-  devopsPrefix = 'qqqDevOps_' # if all branches we create have a unique prefix, we can find them later
+  org = 'PSJH-Dev'
+  devopsPrefix = 'qqqGitHubAdminOps_' # if all branches we create have a unique prefix, we can find them later
   branchName =  devopsPrefix + 'patchNumber48'
-  pr_name = "DevOps patching repo..."
+  # TODO: Replace this with a pull from a markdown file
+  pr_name = "GitHub Admins patching repo..."
   debug_flag = true
   create_output_files(org)
+  # Create a hash of the repos and their statuses from the prs file
+  initialize_prs_hash()
+  # Overwrite the prs file now that the hash has been created
+  create_new_prs_file()
   repos = retrieveRepos(org)
-
+  # TODO: Allow ability to pull files from a specific directory. These can act like projects. AKA change cwd
   repos.each_with_index do |repo, index|
     reportRateLimit("repo") if index % 50 == 0
     suspend_s = 5
     begin
-      if !repo_exists?($client, repo)
-        log($output_csv,"#{repo},warning,Repo does not exist", true)
+      # If the pr is not in the csv file, it most likely has not been created
+      if $prs_hash[repo].nil?
+        create_new_pr(repo, branchName)
         next
       end
-
-      mainBranch = $client.branch(repo, $client.repository(repo).default_branch)
-
-      if !branch_exists?($client, repo, branchName)
-        $client.create_ref(repo, "refs/heads/#{branchName}", mainBranch.commit.sha)
+      # if the pr is in the csv file, check its current status if it has not been merged
+      if $prs_hash[repo]['MergedAt'].nil?
+       update_csv_with_newest_pr_info(repo)
       end
-
-      numberOfFilesAdded = addFilesToRepo(repo, branchName)
-      # reportOnExistingDevOpsPRs(repo, devopsPrefix) # report on existing PRs before creating a new one
-      thePR = create_pull_request(repo, mainBranch, branchName, pr_name)
-      mergeSHA=mergePR(repo, thePR)
-      validateFilesWereAdded(repo, mergeSHA) if debug_flag
-
-
     rescue Octokit::TooManyRequests
       puts "Rate limit exceeded, sleeping for #{suspend_s} seconds"
       sleep suspend_s
